@@ -1,0 +1,4 @@
+- find and gather Pro Tools logs
+- export system information log
+- export all to fibery
+- use system hostname to identify the machine it came from

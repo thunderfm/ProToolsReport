@@ -1,0 +1,55 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>CFBundleExecutable</key>
+    <string>ProToolsReport</string>
+
+    <key>CFBundleIdentifier</key>
+    <string>com.local.protoolsreport</string>
+
+    <key>CFBundleName</key>
+    <string>Pro Tools Report</string>
+
+    <key>CFBundleDisplayName</key>
+    <string>Pro Tools Report</string>
+
+    <key>CFBundleVersion</key>
+    <string>1.0.0</string>
+
+    <key>CFBundleShortVersionString</key>
+    <string>1.0</string>
+
+    <key>CFBundlePackageType</key>
+    <string>APPL</string>
+
+    <key>CFBundleSignature</key>
+    <string>????</string>
+
+    <key>CFBundleInfoDictionaryVersion</key>
+    <string>6.0</string>
+
+    <!-- Allow the app to be opened without being quarantined as "unidentified developer"
+         when the user right-clicks and chooses Open the first time. -->
+    <key>LSMinimumSystemVersion</key>
+    <string>11.0</string>
+
+    <!-- Run as a background helper — no Dock icon, no menu bar -->
+    <key>LSUIElement</key>
+    <false/>
+
+    <!-- Do not appear in the Recent Items menu -->
+    <key>LSBackgroundOnly</key>
+    <false/>
+
+    <key>CFBundleIconFile</key>
+    <string>AppIcon</string>
+
+    <key>NSHighResolutionCapable</key>
+    <true/>
+
+    <!-- Privacy usage descriptions (macOS 12+ may require these) -->
+    <key>NSSystemAdministrationUsageDescription</key>
+    <string>Pro Tools Report needs to read system logs and diagnostic reports to generate a crash report.</string>
+</dict>
+</plist>

@@ -1,0 +1,474 @@
+#!/bin/bash
+# ProToolsReport - macOS crash report & system info collector for Avid Pro Tools
+# Double-click from Desktop after a crash to generate a report folder on your Desktop.
+
+set -euo pipefail
+
+# ---------------------------------------------------------------------------
+# Config
+# ---------------------------------------------------------------------------
+HOURS=2
+TIMESTAMP=$(date '+%Y-%m-%d_%H-%M-%S')
+REPORT_DIR="$HOME/Desktop/ProToolsReport_${TIMESTAMP}"
+LOG_DIR="$REPORT_DIR/crash_logs"
+AVID_LOG_DIR="$REPORT_DIR/avid_logs"
+
+# Fibery workspace settings
+FIBERY_HOST="sound-disposition.fibery.io"
+FIBERY_SPACE="Tickets"
+FIBERY_TYPE="Tickets/Tickets"       # space/database
+FIBERY_LOGS_FIELD="Tickets/Logs"    # file attachment field
+
+# Retrieve Fibery token from macOS Keychain
+KEYCHAIN_SERVICE="ProToolsReport"
+FIBERY_TOKEN=$(security find-generic-password -a "$USER" -s "$KEYCHAIN_SERVICE" -w 2>/dev/null || true)
+
+# If no token stored yet, prompt the user to enter one and save it
+if [ -z "$FIBERY_TOKEN" ]; then
+    FIBERY_TOKEN=$(osascript -e "
+        text returned of (display dialog \"Enter your Fibery API token to enable automatic ticket creation.\n\nLeave blank to skip Fibery integration.\" ¬
+            with title \"Pro Tools Report — First Time Setup\" ¬
+            default answer \"\" ¬
+            buttons {\"Skip\", \"Save\"} ¬
+            default button \"Save\")" 2>/dev/null || true)
+
+    if [ -n "$FIBERY_TOKEN" ]; then
+        security add-generic-password -a "$USER" -s "$KEYCHAIN_SERVICE" -w "$FIBERY_TOKEN" 2>/dev/null \
+            || security add-generic-password -U -a "$USER" -s "$KEYCHAIN_SERVICE" -w "$FIBERY_TOKEN"
+    fi
+fi
+
+# ---------------------------------------------------------------------------
+# Dialogs
+# ---------------------------------------------------------------------------
+progress_dialog_start() {
+    osascript <<'APPLESCRIPT' &
+    tell application "System Events"
+        display dialog "Collecting Pro Tools crash data and system info…\n\nThis may take up to a minute.\nThe report folder will open on your Desktop when done." ¬
+            with title "Pro Tools Report" ¬
+            buttons {} ¬
+            giving up after 120
+    end tell
+APPLESCRIPT
+    PROGRESS_PID=$!
+}
+
+progress_dialog_kill() {
+    kill "$PROGRESS_PID" 2>/dev/null || true
+}
+
+error_dialog() {
+    osascript -e "display dialog \"Error generating report:\n$1\" with title \"Pro Tools Report\" buttons {\"OK\"} default button \"OK\" with icon stop"
+}
+
+# ---------------------------------------------------------------------------
+# Fibery integration
+# ---------------------------------------------------------------------------
+
+# Upload a file to Fibery; prints the returned fibery/id
+fibery_upload_file() {
+    local FILE_PATH="$1"
+    curl -sf -X POST \
+        "https://${FIBERY_HOST}/api/files" \
+        -H "Authorization: Token ${FIBERY_TOKEN}" \
+        -F "file=@${FILE_PATH}" \
+    | python3 -c "import sys,json; print(json.load(sys.stdin).get('fibery/id',''))"
+}
+
+# Create a Tickets entity; prints the returned fibery/id
+fibery_create_ticket() {
+    local TICKET_NAME="$1"
+    local MACHINE="$2"
+    local TS_ISO="$3"
+
+    local BODY
+    BODY=$(python3 - "$TICKET_NAME" "$MACHINE" "$TS_ISO" <<'PYEOF'
+import sys, json
+
+name, machine, ts = sys.argv[1], sys.argv[2], sys.argv[3]
+
+# Field names match your Fibery display names in camelCase.
+# If the mutation returns an error, open the GraphQL IDE to verify field names:
+#   https://sound-disposition.fibery.io/api/graphql/space/Tickets
+mutation = (
+    "mutation { tickets { create("
+    "title: " + json.dumps(name) + " "
+    "timeStamp: " + json.dumps(ts) + " "
+    "machine: " + json.dumps(machine) +
+    ") { message entities { id } } } }"
+)
+print(json.dumps({"query": mutation}))
+PYEOF
+)
+
+    curl -sf -X POST \
+        "https://${FIBERY_HOST}/api/graphql/space/${FIBERY_SPACE}" \
+        -H "Authorization: Token ${FIBERY_TOKEN}" \
+        -H "Content-Type: application/json" \
+        -d "$BODY" \
+    | python3 -c "
+import sys, json
+d = json.load(sys.stdin)
+try:
+    print(d['data']['tickets']['create']['entities'][0]['id'])
+except (KeyError, TypeError, IndexError):
+    sys.stderr.write('Fibery response: ' + json.dumps(d) + '\n')
+    print('')
+"
+}
+
+# Overwrite the Description rich-text field on an existing entity
+fibery_set_description() {
+    local ENTITY_ID="$1"
+    local DESCRIPTION="$2"
+
+    local BODY
+    BODY=$(python3 - "$ENTITY_ID" "$DESCRIPTION" <<'PYEOF'
+import sys, json
+
+entity_id, description = sys.argv[1], sys.argv[2]
+
+mutation = (
+    "mutation { tickets(id: {is: " + json.dumps(entity_id) + "}) { "
+    "overwriteDescription(value: " + json.dumps(description) + ") { message } } }"
+)
+print(json.dumps({"query": mutation}))
+PYEOF
+)
+
+    curl -sf -X POST \
+        "https://${FIBERY_HOST}/api/graphql/space/${FIBERY_SPACE}" \
+        -H "Authorization: Token ${FIBERY_TOKEN}" \
+        -H "Content-Type: application/json" \
+        -d "$BODY" > /dev/null
+}
+
+# Attach an already-uploaded file to an entity's Logs field
+fibery_attach_file() {
+    local ENTITY_ID="$1"
+    local FILE_ID="$2"
+
+    local BODY
+    BODY=$(python3 - "$ENTITY_ID" "$FILE_ID" "$FIBERY_TYPE" "$FIBERY_LOGS_FIELD" <<'PYEOF'
+import sys, json
+entity_id, file_id, ftype, ffield = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4]
+cmd = [{
+    "command": "fibery.entity/add-collection-items",
+    "args": {
+        "type":   ftype,
+        "field":  ffield,
+        "entity": {"fibery/id": entity_id},
+        "items":  [{"fibery/id": file_id}]
+    }
+}]
+print(json.dumps(cmd))
+PYEOF
+)
+
+    curl -sf -X POST \
+        "https://${FIBERY_HOST}/api/commands" \
+        -H "Authorization: Token ${FIBERY_TOKEN}" \
+        -H "Content-Type: application/json" \
+        -d "$BODY" > /dev/null
+}
+
+# Full send-to-Fibery flow; prints entity ID on success, exits non-zero on failure
+send_to_fibery() {
+    # 1. Zip the report folder
+    local ZIP="${REPORT_DIR}.zip"
+    (cd "$HOME/Desktop" && zip -qr "$(basename "$ZIP")" "$(basename "$REPORT_DIR")/") \
+        || { echo "Failed to create zip archive"; return 1; }
+
+    # 2. Upload zip
+    local FILE_ID
+    FILE_ID=$(fibery_upload_file "$ZIP") \
+        || { echo "File upload to Fibery failed"; return 1; }
+    [ -n "$FILE_ID" ] || { echo "Fibery returned no file ID"; return 1; }
+
+    # 3. Build ticket title and description
+    local MACHINE TS TICKET_NAME DESCRIPTION ENTITY_ID
+    MACHINE=$(scutil --get ComputerName 2>/dev/null || hostname)
+    TS=$(date -u '+%Y-%m-%dT%H:%M:%S.000Z')
+    TICKET_NAME="Pro Tools Crash — $(date '+%Y-%m-%d %H:%M') — ${MACHINE}"
+    DESCRIPTION=$(cat "$SUMMARY" 2>/dev/null || echo "(summary unavailable)")
+
+    # 4. Create ticket entity
+    ENTITY_ID=$(fibery_create_ticket "$TICKET_NAME" "$MACHINE" "$TS") \
+        || { echo "Failed to create Fibery ticket"; return 1; }
+    [ -n "$ENTITY_ID" ] || { echo "Fibery returned no entity ID — check field names in the script"; return 1; }
+
+    # 5. Set description from 00_summary.txt
+    fibery_set_description "$ENTITY_ID" "$DESCRIPTION" \
+        || echo "Warning: ticket created but description could not be set" >&2
+
+    # 6. Attach zip to ticket
+    fibery_attach_file "$ENTITY_ID" "$FILE_ID" \
+        || echo "Warning: ticket created but file attachment failed" >&2
+
+    echo "$ENTITY_ID"
+}
+
+# ---------------------------------------------------------------------------
+# Setup
+# ---------------------------------------------------------------------------
+mkdir -p "$REPORT_DIR" "$LOG_DIR" "$AVID_LOG_DIR"
+
+progress_dialog_start
+trap 'progress_dialog_kill' EXIT
+
+# ---------------------------------------------------------------------------
+# 1. Summary header
+# ---------------------------------------------------------------------------
+SUMMARY="$REPORT_DIR/00_summary.txt"
+{
+    echo "========================================"
+    echo " Pro Tools Crash Report"
+    echo " Generated: $(date)"
+    echo " Coverage:  Crash logs: last ${HOURS}h | App logs: today"
+    echo "========================================"
+    echo
+    echo "macOS Version : $(sw_vers -productVersion) ($(sw_vers -buildVersion))"
+    echo "Hostname      : $(scutil --get ComputerName 2>/dev/null || hostname)"
+    echo "User          : $(id -un)"
+    echo "Uptime        : $(uptime)"
+    echo
+    echo "Pro Tools Version:"
+    if [ -d "/Applications/Pro Tools.app" ]; then
+        defaults read "/Applications/Pro Tools.app/Contents/Info.plist" CFBundleShortVersionString 2>/dev/null || echo "  (could not read)"
+    else
+        echo "  Pro Tools not found at /Applications/Pro Tools.app"
+    fi
+    echo
+} > "$SUMMARY"
+
+# ---------------------------------------------------------------------------
+# 2. Crash logs (last N hours, Pro Tools related)
+# ---------------------------------------------------------------------------
+{
+    echo "--- CRASH LOGS (last ${HOURS}h) ---"
+} >> "$SUMMARY"
+
+# Create time marker file for -newer comparison
+python3 -c "
+import os, time
+path = '/tmp/ptreport_cutoff_marker'
+open(path, 'w').close()
+os.utime(path, (time.time() - ${HOURS}*3600, time.time() - ${HOURS}*3600))
+" 2>/dev/null || touch -t "$(date -v-${HOURS}H '+%Y%m%d%H%M')" /tmp/ptreport_cutoff_marker
+
+CRASH_COUNT=0
+for CRASH_DIR in \
+    "$HOME/Library/Logs/DiagnosticReports" \
+    "/Library/Logs/DiagnosticReports"
+do
+    [ -d "$CRASH_DIR" ] || continue
+    while IFS= read -r -d '' CFILE; do
+        BASENAME=$(basename "$CFILE")
+        if echo "$BASENAME" | grep -qi "pro.tools\|ProTools\|avid"; then
+            MATCH=1
+        elif head -20 "$CFILE" 2>/dev/null | grep -qi "pro.tools\|avid"; then
+            MATCH=1
+        else
+            MATCH=0
+        fi
+        if [ "$MATCH" -eq 1 ]; then
+            cp "$CFILE" "$LOG_DIR/" 2>/dev/null || true
+            echo "  Copied: $BASENAME" >> "$SUMMARY"
+            CRASH_COUNT=$(( CRASH_COUNT + 1 ))
+        fi
+    done < <(find "$CRASH_DIR" -maxdepth 2 \
+        \( -name "*.crash" -o -name "*.ips" -o -name "*.hang" \) \
+        -newer /tmp/ptreport_cutoff_marker -print0 2>/dev/null)
+done
+
+if [ "$CRASH_COUNT" -eq 0 ]; then
+    echo "  No Pro Tools crash logs found in the last ${HOURS} hours." >> "$SUMMARY"
+fi
+echo "  Total crash files copied: $CRASH_COUNT" >> "$SUMMARY"
+echo >> "$SUMMARY"
+
+# ---------------------------------------------------------------------------
+# 3. Pro Tools app logs (today) — Pro_Tools and Pro_Tools_Video
+# ---------------------------------------------------------------------------
+{
+    echo "--- PRO TOOLS APP LOGS (today) ---"
+} >> "$SUMMARY"
+
+# Marker set to midnight of today
+TODAY_MARKER=/tmp/ptreport_today_marker
+touch -t "$(date '+%Y%m%d')0000" "$TODAY_MARKER"
+
+AVID_COUNT=0
+AVID_SRC="$HOME/Library/Logs/Avid"
+
+if [ -d "$AVID_SRC" ]; then
+    while IFS= read -r -d '' AFILE; do
+        BASENAME=$(basename "$AFILE")
+        cp "$AFILE" "$AVID_LOG_DIR/$BASENAME" 2>/dev/null || true
+        echo "  Copied: $BASENAME" >> "$SUMMARY"
+        AVID_COUNT=$(( AVID_COUNT + 1 ))
+    done < <(find "$AVID_SRC" -maxdepth 3 -type f \
+        \( -name "Pro_Tools*" -o -name "Pro_Tools_Video*" \) \
+        -newer "$TODAY_MARKER" -print0 2>/dev/null)
+fi
+
+if [ "$AVID_COUNT" -eq 0 ]; then
+    echo "  No Pro_Tools or Pro_Tools_Video logs found today in $AVID_SRC" >> "$SUMMARY"
+fi
+echo >> "$SUMMARY"
+
+rm -f "$TODAY_MARKER"
+
+# ---------------------------------------------------------------------------
+# 4. Unified system log — Pro Tools / Avid filter, last N hours
+# ---------------------------------------------------------------------------
+{
+    echo "--- SYSTEM LOG (last ${HOURS}h, Pro Tools / Avid) ---"
+    echo "  Collecting… (this can take 30–60 seconds)"
+} >> "$SUMMARY"
+
+SYSLOG_OUT="$REPORT_DIR/system_log_protools.txt"
+{
+    echo "System log — Pro Tools / Avid — last ${HOURS}h"
+    echo "Generated: $(date)"
+    echo "========================================"
+    echo
+} > "$SYSLOG_OUT"
+
+log show \
+    --last "${HOURS}h" \
+    --predicate 'process CONTAINS[c] "Pro Tools" OR process CONTAINS[c] "ProTools" OR subsystem CONTAINS[c] "avid" OR process CONTAINS[c] "DAE" OR process CONTAINS[c] "DigiLink"' \
+    --info \
+    >> "$SYSLOG_OUT" 2>&1 || echo "(log show failed or no entries)" >> "$SYSLOG_OUT"
+
+echo "  Done." >> "$SUMMARY"
+echo >> "$SUMMARY"
+
+# ---------------------------------------------------------------------------
+# 5. Full system_profiler (detailed)
+# ---------------------------------------------------------------------------
+{
+    echo "--- SYSTEM PROFILER ---"
+    echo "  Collecting full system profile… (this can take a minute)"
+} >> "$SUMMARY"
+
+SYSINFO_OUT="$REPORT_DIR/system_info_full.txt"
+{
+    echo "Full System Profile"
+    echo "Generated: $(date)"
+    echo "========================================"
+    echo
+} > "$SYSINFO_OUT"
+
+system_profiler \
+    SPHardwareDataType \
+    SPSoftwareDataType \
+    SPMemoryDataType \
+    SPAudioDataType \
+    SPUSBDataType \
+    SPThunderboltDataType \
+    SPPCIDataType \
+    SPStorageDataType \
+    SPFireWireDataType \
+    SPNetworkDataType \
+    SPExtensionsDataType \
+    SPFrameworksDataType \
+    SPPrintersDataType \
+    SPPowerDataType \
+    SPDisplaysDataType \
+    SPBluetoothDataType \
+    -detailLevel full \
+    >> "$SYSINFO_OUT" 2>&1
+
+echo "  Done." >> "$SUMMARY"
+echo >> "$SUMMARY"
+
+# ---------------------------------------------------------------------------
+# 6. Installed audio plugins snapshot
+# ---------------------------------------------------------------------------
+PLUGINS_OUT="$REPORT_DIR/audio_plugins.txt"
+{
+    echo "Audio Plugin Directories"
+    echo "Generated: $(date)"
+    echo "========================================"
+    echo
+    for PDIR in \
+        "/Library/Audio/Plug-Ins/HAL" \
+        "/Library/Audio/Plug-Ins/Components" \
+        "/Library/Audio/Plug-Ins/VST" \
+        "/Library/Audio/Plug-Ins/VST3" \
+        "$HOME/Library/Audio/Plug-Ins/Components" \
+        "$HOME/Library/Audio/Plug-Ins/VST" \
+        "$HOME/Library/Audio/Plug-Ins/VST3" \
+        "/Library/Application Support/Avid/Audio/Plug-Ins" \
+        "$HOME/Library/Application Support/Avid/Audio/Plug-Ins"
+    do
+        echo "## $PDIR"
+        if [ -d "$PDIR" ]; then
+            ls -1A "$PDIR" 2>/dev/null || echo "  (empty)"
+        else
+            echo "  (not found)"
+        fi
+        echo
+    done
+} > "$PLUGINS_OUT"
+
+# ---------------------------------------------------------------------------
+# 7. Running processes snapshot
+# ---------------------------------------------------------------------------
+ps aux > "$REPORT_DIR/running_processes.txt" 2>/dev/null || true
+
+# ---------------------------------------------------------------------------
+# 8. Kernel extensions (kexts) — relevant for audio interfaces
+# ---------------------------------------------------------------------------
+{
+    echo "Loaded Kernel Extensions:"
+    kextstat 2>/dev/null | grep -iv "com.apple" || echo "  (none or kextstat unavailable)"
+} > "$REPORT_DIR/third_party_kexts.txt"
+
+# ---------------------------------------------------------------------------
+# 9. Wrap up summary
+# ---------------------------------------------------------------------------
+{
+    echo "========================================"
+    echo " Collection complete: $(date)"
+    echo " Report folder: $REPORT_DIR"
+    echo "========================================"
+} >> "$SUMMARY"
+
+rm -f /tmp/ptreport_cutoff_marker
+
+progress_dialog_kill
+
+# Open the report folder in Finder
+osascript -e "tell application \"Finder\" to activate" \
+           -e "tell application \"Finder\" to open POSIX file \"$REPORT_DIR\""
+
+# ---------------------------------------------------------------------------
+# 10. Offer to send to Fibery (only shown if token is configured)
+# ---------------------------------------------------------------------------
+if [ -n "$FIBERY_TOKEN" ]; then
+    CHOICE=$(osascript -e "
+        button returned of (display dialog \"Report saved to Desktop:\n${REPORT_DIR##*/}\n\nSend to Fibery as a support ticket?\" ¬
+            with title \"Pro Tools Report\" ¬
+            buttons {\"Skip\", \"Send to Fibery\"} ¬
+            default button \"Send to Fibery\" ¬
+            with icon note)")
+
+    if [ "$CHOICE" = "Send to Fibery" ]; then
+        osascript -e "display notification \"Uploading to Fibery…\" with title \"Pro Tools Report\""
+
+        if RESULT=$(send_to_fibery 2>&1); then
+            osascript -e "display notification \"Ticket created in Fibery.\" with title \"Pro Tools Report\""
+        else
+            osascript -e "display dialog \"Failed to send to Fibery:\n${RESULT}\" with title \"Pro Tools Report\" buttons {\"OK\"} default button \"OK\" with icon stop"
+        fi
+    fi
+else
+    osascript -e "
+        display dialog \"Report saved to Desktop:\n${REPORT_DIR##*/}\" ¬
+            with title \"Pro Tools Report\" ¬
+            buttons {\"OK\"} ¬
+            default button \"OK\" ¬
+            with icon note"
+fi
