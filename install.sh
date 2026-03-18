@@ -20,6 +20,14 @@ chmod +x "$INSTALL_DIR/$APP_NAME/Contents/MacOS/ProToolsReport"
 # Remove macOS quarantine flag so it opens without Gatekeeper blocking it
 xattr -dr com.apple.quarantine "$INSTALL_DIR/$APP_NAME" 2>/dev/null || true
 
+# Seed Fibery token into Keychain if provided at install time
+if [ -n "${FIBERY_TOKEN:-}" ]; then
+    security add-generic-password -a "$USER" -s "ProToolsReport" -w "$FIBERY_TOKEN" 2>/dev/null \
+        || security add-generic-password -U -a "$USER" -s "ProToolsReport" -w "$FIBERY_TOKEN" 2>/dev/null \
+        || true
+    echo "Fibery token saved to Keychain."
+fi
+
 echo ""
 echo "Installed to $INSTALL_DIR/$APP_NAME"
 echo ""
